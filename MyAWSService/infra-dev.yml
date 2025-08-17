@@ -1,27 +1,16 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  月額 1,100 円以内を目標とする最小構成
   - EC2 (t4g.micro)
-  - Aurora Serverless v2 (Min 0.5 ACU, Auto Pause 5min)
+  - RDS MySql (Min 0.5 ACU, Auto Pause 5min)
   - AWS Budgets による上限アラート
 
 Parameters:
-  KeyName:
-    Type: AWS::EC2::KeyPair::KeyName
-    Description: EC2 に接続するキーペア名
   VpcCidr:
     Type: String
     Default: 10.0.0.0/16
 
-Mappings:
-  # Aurora で利用するエンジンおよびバージョン
-  DBEngineMap:
-    mysql80:
-      Engine: aurora-mysql
-      EngineVersion: '8.0.mysql_aurora.3.04.1'
-
 Resources:
-  # EC2用のIAM ロール
+  # EC2AMRole
   EC2InstanceRole:
     Type: AWS::IAM::Role
     Properties:
@@ -42,23 +31,16 @@ Resources:
       Roles:
         - !Ref EC2InstanceRole
 
-  # 安全な DB 資格情報（ユーザ名・パスワード）を自動生成
   DBMasterSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: aurora-master-credentials
       Description: Master credentials (username & password) for Aurora
       GenerateSecretString:
-        # username もランダム生成させる
-        SecretStringTemplate: "{}"
+        SecretStringTemplate: '{"username":"Admin"}'
         GenerateStringKey: "password"
         PasswordLength: 16
         ExcludeCharacters: "\"@/\\' "
-        # username 用設定
-        AddRandomPassword:
-          Length: 12
-          ExcludeCharacters: "\"@/\\' "
-          PasswordKey: "username"
       Tags:
         - Key: Name
           Value: AuroraMasterSecret
@@ -80,6 +62,21 @@ Resources:
       CidrBlock: 10.0.1.0/24
       MapPublicIpOnLaunch: true
       AvailabilityZone: !Select [0, !GetAZs '']
+      
+  PublicSubnetB: 
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]  
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
 
   InternetGateway:
     Type: AWS::EC2::InternetGateway
@@ -116,10 +113,6 @@ Resources:
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: 125.51.109.221/32     # 必要に応じて自宅IPに制限
-        - IpProtocol: tcp
           FromPort: 3306
           ToPort: 3306
           CidrIp: 125.51.109.221/32
@@ -129,7 +122,6 @@ Resources:
     Properties:
       InstanceType: t4g.nano              # 1 vCPU / 0.25 GiB RAM
       ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}'
-      KeyName: !Ref KeyName
       IamInstanceProfile: !Ref EC2InstanceProfile
       SubnetId: !Ref PublicSubnet
       SecurityGroupIds:
@@ -138,7 +130,7 @@ Resources:
         - DeviceName: /dev/xvda
           Ebs:
             VolumeType: gp3
-            VolumeSize: 8        # GiB – 最小サイズ
+            VolumeSize: 8        # GiB – minSize
       Tags:
         - Key: Name
           Value: LowCostInstance
@@ -148,9 +140,9 @@ Resources:
     Type: AWS::SSM::MaintenanceWindow
     Properties:
       Name: Weekly-OS-Patch
-      Schedule: "cron(0 16 ? * MON *)"   # 月曜 01:00 JST
-      Duration: 2                       # 最大 2 時間
-      Cutoff: 1                         # 終了 1 時間前に新タスク開始禁止
+      Schedule: "cron(0 16 ? * MON *)"  
+      Duration: 2                     
+      Cutoff: 1                         
       AllowUnassociatedTargets: false
       Tags:
         - Key: Name
@@ -171,7 +163,7 @@ Resources:
     Type: AWS::SSM::MaintenanceWindowTask
     Properties:
       WindowId: !Ref PatchMaintenanceWindow
-      TaskArn: AWS-RunPatchBaseline                 # 標準ドキュメント
+      TaskArn: AWS-RunPatchBaseline                 
       TaskType: RUN_COMMAND
       Priority: 1
       MaxConcurrency: "1"
@@ -181,12 +173,13 @@ Resources:
           Values:
             - !Ref PatchMaintenanceTarget
       TaskInvocationParameters:
-        RunCommand:
+        MaintenanceWindowRunCommandParameters:
           Parameters:
             Operation:
-              - Install                   # ← セキュリティ & 推奨アップデート
+              - Install
             RebootOption:
               - RebootIfNeeded
+  
   # ----------------------------- ③ SSM Maintenance Window 〆-----------------------------
   
   # ---------- RDS MySQL (db.t4g.micro) ----------
@@ -196,25 +189,26 @@ Resources:
       DBSubnetGroupDescription: RDS subnet group
       SubnetIds:
         - !Ref PublicSubnet
-
+        - !Ref PublicSubnetB
+  
   RDSInstance:
     Type: AWS::RDS::DBInstance
     Properties:
       DBInstanceIdentifier: app-mysql
       Engine: mysql
-      EngineVersion: "8.0.35"
+      EngineVersion: "8.4.6"
       DBInstanceClass: db.t4g.micro
       AllocatedStorage: 20
       StorageType: gp3
       BackupRetentionPeriod: 7
       MasterUsername: !Sub "{{resolve:secretsmanager:${DBMasterSecret}:SecretString:username}}"
-      MasterUserPassword:
-        SecretManagerArn: !Ref DBMasterSecret
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DBMasterSecret}:SecretString:password}}"
       VPCSecurityGroups:
         - !Ref EC2SecurityGroup
       DBSubnetGroupName: !Ref RDSSubnetGroup
       PubliclyAccessible: true
       DeletionProtection: false
+      MultiAZ : false
       Tags:
         - Key: Name
           Value: LowCostInstance
@@ -225,8 +219,8 @@ Resources:
       Budget:
         BudgetName: LowCostMonthBudget
         BudgetLimit:
-          Amount: 1100
-          Unit: JPY
+          Amount: 7.33
+          Unit: USD
         BudgetType: COST
         TimeUnit: MONTHLY
         CostFilters: {}
@@ -234,13 +228,13 @@ Resources:
         - Notification:
             ComparisonOperator: GREATER_THAN
             NotificationType: ACTUAL
-            Threshold: 90        # 90% 到達で通知
+            Threshold: 90       
             ThresholdType: PERCENTAGE
           Subscribers:
             - SubscriptionType: EMAIL
-              Address: ryoku@blueremarks.com   # 置き換えてください
+              Address: ryoku@blueremarks.com   
       
-  # ------------------ Scheduler 用 IAM ロール ------------------
+  # ------------------ SchedulerIAMRole start ------------------
   SchedulerControlRole:
     Type: AWS::IAM::Role
     Properties:
@@ -266,14 +260,14 @@ Resources:
                   - rds:StartDBInstance
                   - rds:StopDBInstance
                 Resource: !Sub arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:${RDSInstance}
-            # ------------------ Scheduler 用 IAM ロール 〆 ------------------
+            # ------------------ SSchedulerIAMRole end ------------------
 
   # ------------------ EventBridge Scheduler ------------------
   EC2StartSchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
       FlexibleTimeWindow:
-        Mode: OFF
+        Mode: "OFF"
       ScheduleExpression: "cron(0 0 ? * SAT,SUN *)"  # 09:00 JST = 00:00 UTC
       Target:
         Arn: arn:aws:scheduler:::aws-sdk:ec2:startInstances
@@ -287,7 +281,7 @@ Resources:
     Type: AWS::Scheduler::Schedule
     Properties:
       FlexibleTimeWindow:
-        Mode: OFF
+        Mode: "OFF"
       ScheduleExpression: "cron(0 10 ? * SAT,SUN *)" # 19:00 JST = 10:00 UTC
       Target:
         Arn: arn:aws:scheduler:::aws-sdk:ec2:stopInstances
@@ -301,7 +295,7 @@ Resources:
     Type: AWS::Scheduler::Schedule
     Properties:
       FlexibleTimeWindow:
-        Mode: OFF
+        Mode: "OFF"
       ScheduleExpression: "cron(0 0 ? * SAT,SUN *)"  # 09:00 JST
       Target:
         Arn: arn:aws:scheduler:::aws-sdk:rds:startDBInstance
@@ -315,7 +309,7 @@ Resources:
     Type: AWS::Scheduler::Schedule
     Properties:
       FlexibleTimeWindow:
-        Mode: OFF
+        Mode: "OFF"
       ScheduleExpression: "cron(0 10 ? * SAT,SUN *)" # 19:00 JST
       Target:
         Arn: arn:aws:scheduler:::aws-sdk:rds:stopDBInstance
