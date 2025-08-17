@@ -1,0 +1,427 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  月額 1,100 円以内を目標とする最小構成
+  - EC2 (t4g.micro)
+  - Aurora Serverless v2 (Min 0.5 ACU, Auto Pause 5min)
+  - AWS Budgets による上限アラート
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 に接続するキーペア名
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+  GitHubConnectionArn:
+    Type: String
+    Description: CodeStar Connections の ARN (GitHub OIDC)
+
+Mappings:
+  # Aurora で利用するエンジンおよびバージョン
+  DBEngineMap:
+    mysql80:
+      Engine: aurora-mysql
+      EngineVersion: '8.0.mysql_aurora.3.04.1'
+
+Resources:
+  # EC2用のIAM ロール
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # 安全な DB 資格情報（ユーザ名・パスワード）を自動生成
+  DBMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: aurora-master-credentials
+      Description: Master credentials (username & password) for Aurora
+      GenerateSecretString:
+        # username もランダム生成させる
+        SecretStringTemplate: "{}"
+        GenerateStringKey: "password"
+        PasswordLength: 16
+        ExcludeCharacters: "\"@/\\' "
+        # username 用設定
+        AddRandomPassword:
+          Length: 12
+          ExcludeCharacters: "\"@/\\' "
+          PasswordKey: "username"
+      Tags:
+        - Key: Name
+          Value: AuroraMasterSecret
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: LowCostVpc
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH and MySQL
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 125.51.109.221/32     # 必要に応じて自宅IPに制限
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 125.51.109.221/32
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t4g.micro              # 1 vCPU / 0.5 GiB RAM
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}'
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 8        # GiB – 最小サイズ
+            Fn::Base64: !Sub |
+              #!/bin/bash -xe
+              dnf install -y dotnet-runtime-9.0 unzip
+              mkdir -p /var/www/app
+              cat >/etc/systemd/system/kestrel-myapp.service <<'EOF'
+              [Unit]
+              Description=ASP.NET Core App
+              [Service]
+              WorkingDirectory=/var/www/app
+              ExecStart=/usr/bin/dotnet /var/www/app/MyAWSService.dll
+              Restart=always
+              [Install]
+              WantedBy=multi-user.target
+              EOF
+              systemctl daemon-reload
+              systemctl enable kestrel-myapp
+      UserData:
+        
+      Tags:
+        - Key: Name
+          Value: LowCostInstance
+          
+# ----------------------------- ③ SSM Maintenance Window -----------------------------
+  PatchMaintenanceWindow:
+    Type: AWS::SSM::MaintenanceWindow
+    Properties:
+      Name: Weekly-OS-Patch
+      Schedule: "cron(0 16 ? * MON *)"   # 月曜 01:00 JST
+      Duration: 2                       # 最大 2 時間
+      Cutoff: 1                         # 終了 1 時間前に新タスク開始禁止
+      AllowUnassociatedTargets: false
+      Tags:
+        - Key: Name
+          Value: WeeklyPatchMW
+
+  PatchMaintenanceTarget:
+    Type: AWS::SSM::MaintenanceWindowTarget
+    Properties:
+      WindowId: !Ref PatchMaintenanceWindow
+      ResourceType: INSTANCE
+      Targets:
+        - Key: InstanceIds
+          Values:
+            - !Ref EC2Instance
+      OwnerInformation: "Weekly patch target"
+
+  PatchMaintenanceTask:
+    Type: AWS::SSM::MaintenanceWindowTask
+    Properties:
+      WindowId: !Ref PatchMaintenanceWindow
+      TaskArn: AWS-RunPatchBaseline                 # 標準ドキュメント
+      TaskType: RUN_COMMAND
+      Priority: 1
+      MaxConcurrency: "1"
+      MaxErrors: "1"
+      Targets:
+        - Key: WindowTargetIds
+          Values:
+            - !Ref PatchMaintenanceTarget
+      TaskInvocationParameters:
+        RunCommand:
+          Parameters:
+            Operation:
+              - Install                   # ← セキュリティ & 推奨アップデート
+            RebootOption:
+              - RebootIfNeeded
+  # ----------------------------- ③ SSM Maintenance Window 〆-----------------------------
+
+  # Aurora Serverless v2 (MySQL8)　特徴としてDNS固定、IPアドレスはスケーリングに伴い変動する
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Aurora subnet group
+      SubnetIds:
+        - !Ref PublicSubnet
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      # --- シークレットから動的参照 ---
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DBMasterSecret}:SecretString:username}}"
+      MasterUserPassword:
+        SecretManagerArn: !Ref DBMasterSecret
+      # --------------------------------
+      Engine: !FindInMap [DBEngineMap, mysql80, Engine]
+      EngineVersion: !FindInMap [DBEngineMap, mysql80, EngineVersion]
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0
+        MaxCapacity: 1
+      DatabaseName: appdb
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      EnableHttpEndpoint: false
+
+
+  Budget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: LowCostMonthBudget
+        BudgetLimit:
+          Amount: 1100
+          Unit: JPY
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        CostFilters: {}
+      NotificationsWithSubscribers:
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 90        # 90% 到達で通知
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: ryoku@blueremarks.com   # 置き換えてください
+              
+  # ----------------------------- CD Pipeline start -----------------------------
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+              
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeBuildDeveloperAccess
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      
+      Policies:
+        - PolicyName: ArtifactUpload
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${ArtifactBucket.Arn}/*"
+                
+  DotnetBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: dotnet9-build
+      ServiceRole: !GetAtt BuildRole.Arn
+      Environment:
+        Type: ARM_CONTAINER     # t4g は arm64
+        Image: public.ecr.aws/docker/library/dotnet:9.0-sdk
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: false
+      Artifacts:
+        Type: S3
+        Location: !Ref ArtifactBucket
+        Packaging: ZIP
+        Name: build-output.zip
+      Source:
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 15
+      BuildSpec: |
+        version: 0.2
+        phases:
+          build:
+            commands:
+              - dotnet publish -c Release -o publish
+        artifacts:
+          base-directory: publish
+          files:
+            - '**/*'
+
+
+  PipelineDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess    # 開発用簡易 (縮小可)
+
+  PipelineInvokeSSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeRunCommand
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt EC2InstanceRole.Arn
+                
+  
+  AppPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt PipelineInvokeSSMRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: 1
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: user-org/myawsservice
+                BranchName: main
+                DetectChanges: true
+        - Name: Build
+          Actions:
+            - Name: BuildDotnet
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref DotnetBuildProject
+        - Name: Deploy
+          Actions:
+            - Name: SSMDeploy
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: SSM
+                Version: 1
+              InputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                InstanceIds: !Ref EC2Instance
+                DocumentName: AWS-RunShellScript
+                Parameters: |
+                  commands:
+                    - aws s3 cp s3://${ArtifactBucket}/build-output.zip /tmp/build.zip
+                    - unzip -o /tmp/build.zip -d /var/www/app
+                    - systemctl restart kestrel-myapp
+
+# ----------------------------- CD Pipeline end -----------------------------
+Outputs:
+  EC2PublicIP:
+    Value: !GetAtt EC2Instance.PublicIp
+    Export:
+      Name: EC2PublicIP
+  AuroraEndpoint:
+    Value: !GetAtt AuroraCluster.Endpoint.Address
