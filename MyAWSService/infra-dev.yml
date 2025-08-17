@@ -12,9 +12,6 @@ Parameters:
   VpcCidr:
     Type: String
     Default: 10.0.0.0/16
-  GitHubConnectionArn:
-    Type: String
-    Description: CodeStar Connections の ARN (GitHub OIDC)
 
 Mappings:
   # Aurora で利用するエンジンおよびバージョン
@@ -37,6 +34,7 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
 
   EC2InstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -129,7 +127,7 @@ Resources:
   EC2Instance:
     Type: AWS::EC2::Instance
     Properties:
-      InstanceType: t4g.micro              # 1 vCPU / 0.5 GiB RAM
+      InstanceType: t4g.nano              # 1 vCPU / 0.25 GiB RAM
       ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}'
       KeyName: !Ref KeyName
       IamInstanceProfile: !Ref EC2InstanceProfile
@@ -141,24 +139,6 @@ Resources:
           Ebs:
             VolumeType: gp3
             VolumeSize: 8        # GiB – 最小サイズ
-            Fn::Base64: !Sub |
-              #!/bin/bash -xe
-              dnf install -y dotnet-runtime-9.0 unzip
-              mkdir -p /var/www/app
-              cat >/etc/systemd/system/kestrel-myapp.service <<'EOF'
-              [Unit]
-              Description=ASP.NET Core App
-              [Service]
-              WorkingDirectory=/var/www/app
-              ExecStart=/usr/bin/dotnet /var/www/app/MyAWSService.dll
-              Restart=always
-              [Install]
-              WantedBy=multi-user.target
-              EOF
-              systemctl daemon-reload
-              systemctl enable kestrel-myapp
-      UserData:
-        
       Tags:
         - Key: Name
           Value: LowCostInstance
@@ -208,37 +188,37 @@ Resources:
             RebootOption:
               - RebootIfNeeded
   # ----------------------------- ③ SSM Maintenance Window 〆-----------------------------
-
-  # Aurora Serverless v2 (MySQL8)　特徴としてDNS固定、IPアドレスはスケーリングに伴い変動する
-  DBSubnetGroup:
+  
+  # ---------- RDS MySQL (db.t4g.micro) ----------
+  RDSSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
-      DBSubnetGroupDescription: Aurora subnet group
+      DBSubnetGroupDescription: RDS subnet group
       SubnetIds:
         - !Ref PublicSubnet
 
-  AuroraCluster:
-    Type: AWS::RDS::DBCluster
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
     Properties:
-      # --- シークレットから動的参照 ---
+      DBInstanceIdentifier: app-mysql
+      Engine: mysql
+      EngineVersion: "8.0.35"
+      DBInstanceClass: db.t4g.micro
+      AllocatedStorage: 20
+      StorageType: gp3
+      BackupRetentionPeriod: 7
       MasterUsername: !Sub "{{resolve:secretsmanager:${DBMasterSecret}:SecretString:username}}"
       MasterUserPassword:
         SecretManagerArn: !Ref DBMasterSecret
-      # --------------------------------
-      Engine: !FindInMap [DBEngineMap, mysql80, Engine]
-      EngineVersion: !FindInMap [DBEngineMap, mysql80, EngineVersion]
-      ServerlessV2ScalingConfiguration:
-        MinCapacity: 0
-        MaxCapacity: 1
-      DatabaseName: appdb
-      DBSubnetGroupName: !Ref DBSubnetGroup
-      VpcSecurityGroupIds:
+      VPCSecurityGroups:
         - !Ref EC2SecurityGroup
-      BackupRetentionPeriod: 1
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      PubliclyAccessible: true
       DeletionProtection: false
-      EnableHttpEndpoint: false
-
-
+      Tags:
+        - Key: Name
+          Value: LowCostInstance
+  
   Budget:
     Type: AWS::Budgets::Budget
     Properties:
@@ -259,71 +239,9 @@ Resources:
           Subscribers:
             - SubscriptionType: EMAIL
               Address: ryoku@blueremarks.com   # 置き換えてください
-              
-  # ----------------------------- CD Pipeline start -----------------------------
-  ArtifactBucket:
-    Type: AWS::S3::Bucket
-    DeletionPolicy: Delete
-    Properties:
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
-              
-  BuildRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: codebuild.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AWSCodeBuildDeveloperAccess
-        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
       
-      Policies:
-        - PolicyName: ArtifactUpload
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: s3:PutObject
-                Resource: !Sub "${ArtifactBucket.Arn}/*"
-                
-  DotnetBuildProject:
-    Type: AWS::CodeBuild::Project
-    Properties:
-      Name: dotnet9-build
-      ServiceRole: !GetAtt BuildRole.Arn
-      Environment:
-        Type: ARM_CONTAINER     # t4g は arm64
-        Image: public.ecr.aws/docker/library/dotnet:9.0-sdk
-        ComputeType: BUILD_GENERAL1_SMALL
-        PrivilegedMode: false
-      Artifacts:
-        Type: S3
-        Location: !Ref ArtifactBucket
-        Packaging: ZIP
-        Name: build-output.zip
-      Source:
-        Type: CODEPIPELINE
-      TimeoutInMinutes: 15
-      BuildSpec: |
-        version: 0.2
-        phases:
-          build:
-            commands:
-              - dotnet publish -c Release -o publish
-        artifacts:
-          base-directory: publish
-          files:
-            - '**/*'
-
-
-  PipelineDeployRole:
+  # ------------------ Scheduler 用 IAM ロール ------------------
+  SchedulerControlRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -331,97 +249,88 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: codedeploy.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AdministratorAccess    # 開発用簡易 (縮小可)
-
-  PipelineInvokeSSMRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: codepipeline.amazonaws.com
+              Service: scheduler.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: InvokeRunCommand
+        - PolicyName: ControlEC2RDS
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
-                  - ssm:SendCommand
-                Resource: "*"
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${EC2Instance}
               - Effect: Allow
                 Action:
-                  - iam:PassRole
-                Resource: !GetAtt EC2InstanceRole.Arn
-                
-  
-  AppPipeline:
-    Type: AWS::CodePipeline::Pipeline
-    Properties:
-      RoleArn: !GetAtt PipelineInvokeSSMRole.Arn
-      ArtifactStore:
-        Type: S3
-        Location: !Ref ArtifactBucket
-      Stages:
-        - Name: Source
-          Actions:
-            - Name: GitHubSource
-              ActionTypeId:
-                Category: Source
-                Owner: AWS
-                Provider: CodeStarSourceConnection
-                Version: 1
-              OutputArtifacts:
-                - Name: SourceOutput
-              Configuration:
-                ConnectionArn: !Ref GitHubConnectionArn
-                FullRepositoryId: user-org/myawsservice
-                BranchName: main
-                DetectChanges: true
-        - Name: Build
-          Actions:
-            - Name: BuildDotnet
-              ActionTypeId:
-                Category: Build
-                Owner: AWS
-                Provider: CodeBuild
-                Version: 1
-              InputArtifacts:
-                - Name: SourceOutput
-              OutputArtifacts:
-                - Name: BuildArtifact
-              Configuration:
-                ProjectName: !Ref DotnetBuildProject
-        - Name: Deploy
-          Actions:
-            - Name: SSMDeploy
-              ActionTypeId:
-                Category: Invoke
-                Owner: AWS
-                Provider: SSM
-                Version: 1
-              InputArtifacts:
-                - Name: BuildArtifact
-              Configuration:
-                InstanceIds: !Ref EC2Instance
-                DocumentName: AWS-RunShellScript
-                Parameters: |
-                  commands:
-                    - aws s3 cp s3://${ArtifactBucket}/build-output.zip /tmp/build.zip
-                    - unzip -o /tmp/build.zip -d /var/www/app
-                    - systemctl restart kestrel-myapp
+                  - rds:StartDBInstance
+                  - rds:StopDBInstance
+                Resource: !Sub arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:${RDSInstance}
+            # ------------------ Scheduler 用 IAM ロール 〆 ------------------
 
-# ----------------------------- CD Pipeline end -----------------------------
+  # ------------------ EventBridge Scheduler ------------------
+  EC2StartSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      FlexibleTimeWindow:
+        Mode: OFF
+      ScheduleExpression: "cron(0 0 ? * SAT,SUN *)"  # 09:00 JST = 00:00 UTC
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:ec2:startInstances
+        RoleArn: !GetAtt SchedulerControlRole.Arn
+        Input: !Sub |
+          {
+            "InstanceIds": ["${EC2Instance}"]
+          }
+
+  EC2StopSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      FlexibleTimeWindow:
+        Mode: OFF
+      ScheduleExpression: "cron(0 10 ? * SAT,SUN *)" # 19:00 JST = 10:00 UTC
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:ec2:stopInstances
+        RoleArn: !GetAtt SchedulerControlRole.Arn
+        Input: !Sub |
+          {
+            "InstanceIds": ["${EC2Instance}"]
+          }
+
+  RDSStartSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      FlexibleTimeWindow:
+        Mode: OFF
+      ScheduleExpression: "cron(0 0 ? * SAT,SUN *)"  # 09:00 JST
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:rds:startDBInstance
+        RoleArn: !GetAtt SchedulerControlRole.Arn
+        Input: !Sub |
+          {
+            "DbInstanceIdentifier": "app-mysql"
+          }
+
+  RDSStopSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      FlexibleTimeWindow:
+        Mode: OFF
+      ScheduleExpression: "cron(0 10 ? * SAT,SUN *)" # 19:00 JST
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:rds:stopDBInstance
+        RoleArn: !GetAtt SchedulerControlRole.Arn
+        Input: !Sub |
+          {
+            "DbInstanceIdentifier": "app-mysql"
+          }
+  # ------------------ EventBridge Scheduler 〆 ------------------
+
+
 Outputs:
   EC2PublicIP:
     Value: !GetAtt EC2Instance.PublicIp
     Export:
       Name: EC2PublicIP
-  AuroraEndpoint:
-    Value: !GetAtt AuroraCluster.Endpoint.Address
+  RDSEndpoint:
+    Value: !GetAtt RDSInstance.Endpoint.Address
