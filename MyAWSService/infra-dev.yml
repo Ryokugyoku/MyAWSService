@@ -34,7 +34,7 @@ Resources:
   DBMasterSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Name: aurora-master-credentials
+      Name: db-master-secret
       Description: Master credentials (username & password) for Aurora
       GenerateSecretString:
         SecretStringTemplate: '{"username":"Admin"}'
